@@ -1,0 +1,13 @@
+[Unit]
+Description=Apple TV + Hue backlight sync service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/greg/atv_backlight_service/
+ExecStart=/home/greg/atv_backlight_service/venv/bin/python3 -m atv_backlight_service run
+Environment="PYTHONUNBUFFERED=TRUE"
+Restart=on-failure
+StandardOutput=journal
+
+[Install]
+WantedBy=default.target
