@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/greg/atv_backlight_service/
-ExecStart=/home/greg/atv_backlight_service/venv/bin/python3 -m atv_backlight_service run
+WorkingDirectory=/home/greg/scripts/atv_backlight_service/
+ExecStart=/home/greg/scripts/atv_backlight_service/venv/bin/python3 -m atv_backlight_service run
 Environment="PYTHONUNBUFFERED=TRUE"
 Restart=on-failure
 StandardOutput=journal
