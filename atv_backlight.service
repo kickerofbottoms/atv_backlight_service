@@ -1,5 +1,7 @@
 [Unit]
 Description=Apple TV + Hue backlight sync service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple

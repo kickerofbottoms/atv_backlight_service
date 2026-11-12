@@ -147,8 +147,6 @@ async def _read_input(loop: asyncio.AbstractEventLoop, prompt: str):
     sys.stdout.write(prompt)
     sys.stdout.flush()
     user_input = await loop.run_in_executor(None, sys.stdin.readline)
-    sys.stdout.write("\n")
-    sys.stdout.flush()
     return user_input.strip()
 
 
