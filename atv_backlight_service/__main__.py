@@ -49,7 +49,7 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
         self.atv = None
         self.shutdown_event = shutdown_event
         self.connection_lost_event = asyncio.Event()
-        self.tasks = []
+        self.tasks = set()
 
     @property
     def name(self):
@@ -73,7 +73,7 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
                 value=True,
                 transitiontime=app_config.backlight_transition,
             ))
-            self.tasks.append(task)
+            self.tasks.add(task)
         elif new_state == pyatv.const.PowerState.Off:
             task = asyncio.create_task(asyncio.to_thread(
                 self.bridge.set_light,
@@ -82,7 +82,7 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
                 value=False,
                 transitiontime=app_config.backlight_transition,
             ))
-            self.tasks.append(task)
+            self.tasks.add(task)
 
     def connection_lost(self, exception):
         print(f"{self.name} lost connection:", str(exception))
