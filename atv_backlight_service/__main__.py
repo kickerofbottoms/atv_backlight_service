@@ -39,14 +39,17 @@ pyatv_logger.setLevel(logging.WARNING)
 
 app_config = Config.load()
 
+RECONNECT_DELAY_S = 5
+
 
 class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener):
-    def __init__(self, identifier, bridge, shutdown: asyncio.Event):
+    def __init__(self, identifier, bridge, shutdown_event: asyncio.Event):
         self.identifier = identifier
         self.bridge = bridge
         self.atv = None
-        self.shutdown = shutdown
-        self.connection_lost = asyncio.Event()
+        self.shutdown_event = shutdown_event
+        self.connection_lost_event = asyncio.Event()
+        self.tasks = []
 
     @property
     def name(self):
@@ -63,51 +66,62 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
     ):
         print(f"{self.name} {new_state.name} (light={self.light_id})")
         if new_state == pyatv.const.PowerState.On:
-            self.bridge.set_light(
-                light_id=self.light_id,
-                parameter='on',
-                value=True,
-                transitiontime=app_config.backlight_transition
+            task = asyncio.to_thread(
+                self.bridge.set_light(
+                    light_id=self.light_id,
+                    parameter='on',
+                    value=True,
+                    transitiontime=app_config.backlight_transition
+                )
             )
+            self.tasks.append(task)
         elif new_state == pyatv.const.PowerState.Off:
-            self.bridge.set_light(
-                light_id=self.light_id,
-                parameter='on',
-                value=False,
-                transitiontime=app_config.backlight_transition
+            task = asyncio.to_thread(
+                self.bridge.set_light(
+                    light_id=self.light_id,
+                    parameter='on',
+                    value=False,
+                    transitiontime=app_config.backlight_transition
+                )
             )
+            self.tasks.append(task)
 
     def connection_lost(self, exception):
         print(f"{self.name} lost connection:", str(exception))
-        self.connection_lost.set()
+        self.connection_lost_event.set()
 
     def connection_closed(self):
         print(f"{self.name} connection closed")
-        self.connection_lost.set()
+        self.connection_lost_event.set()
 
     async def persist(self, loop, storage):
-        while not self.shutdown.is_set():
-            self.connection_lost.clear()
+        while not self.shutdown_event.is_set():
+            self.connection_lost_event.clear()
 
-            print(f"{self.name} connecting")
-            connected, msg = await self.connect(loop, storage)
-            print(msg)
+            try:
+                print(f"{self.name} connecting")
+                connected, msg = await self.connect(loop, storage)
+                print(msg)
 
-            if not connected:
+                if connected:
+                    while not (
+                            self.shutdown_event.is_set() or
+                            self.connection_lost_event.is_set()):
+                        if self.tasks:
+
+                            done, self.tasks = await asyncio.wait(
+                                self.tasks, timeout=1)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"{self.name} connection attempt failed: {e}")
+                await asyncio.sleep(RECONNECT_DELAY_S)
+            finally:
+                await self.close()
+
+            if not self.shutdown_event.is_set():
                 await asyncio.sleep(1)
-                continue
-
-            while not (self.shutdown.is_set() or self.connection_lost.is_set()):
-                try:
-                    await asyncio.sleep(1)
-                except asyncio.CancelledError:
-                    print("Shutting down")
-                    self.shutdown.set()
-
-            if self.connection_lost.is_set():
-                print(f"{self.name} connection lost")
-
-            await self.close()
 
     async def connect(self, loop, storage):
         configs = await pyatv.scan(
@@ -263,7 +277,8 @@ async def atv_status(loop):
     for conf in atvs:
         atv = await pyatv.connect(conf, loop, storage=storage)
         print(f"{conf.name}: {atv.power.power_state}")
-        atv.close()
+        tasks = atv.close()
+        await asyncio.gather(*tasks)
 
 
 async def hue_pair(loop, address):
@@ -380,16 +395,16 @@ async def attach_backlight(loop):
 
 async def run_service(loop):
     print("ATV backlight service started")
-    shutdown = asyncio.Event()
+    shutdown_event = asyncio.Event()
 
     if not app_config.atv:
         print("No ATVs configured")
-        shutdown.set()
+        shutdown_event.set()
         return
 
     if app_config.hue is None:
         print("No Hue bridge configured")
-        shutdown.set()
+        shutdown_event.set()
         return
 
     print("Connecting to Hue bridge")
@@ -411,7 +426,7 @@ async def run_service(loop):
         if atv_info.light_id is None:
             print(f"{atv_info.name} has no attached lights, skipping")
             continue
-        connection = ATVListener(atv_id, bridge, shutdown)
+        connection = ATVListener(atv_id, bridge, shutdown_event)
         connections.append(connection)
         task = asyncio.create_task(connection.persist(loop, storage))
         tasks.append(task)
@@ -419,7 +434,26 @@ async def run_service(loop):
     try:
         await asyncio.gather(*tasks)
     except asyncio.CancelledError:
-        pass
+        print("Service cancellation requested")
+        shutdown_event.set()
+        raise
+    except Exception:
+        print("A listener failed; stopping service")
+        shutdown_event.set()
+        raise
+    finally:
+        shutdown_event.set()
+
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for task, result in zip(tasks, results):
+            if isinstance(result, Exception) and not isinstance(
+                result, asyncio.CancelledError
+            ):
+                print(f"Listener task failed: {result}")
 
     print("Service stopped")
 
