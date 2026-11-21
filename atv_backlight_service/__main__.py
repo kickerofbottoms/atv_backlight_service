@@ -66,24 +66,22 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
     ):
         print(f"{self.name} {new_state.name} (light={self.light_id})")
         if new_state == pyatv.const.PowerState.On:
-            task = asyncio.to_thread(
-                self.bridge.set_light(
-                    light_id=self.light_id,
-                    parameter='on',
-                    value=True,
-                    transitiontime=app_config.backlight_transition
-                )
-            )
+            task = asyncio.create_task(asyncio.to_thread(
+                self.bridge.set_light,
+                light_id=self.light_id,
+                parameter="on",
+                value=True,
+                transitiontime=app_config.backlight_transition,
+            ))
             self.tasks.append(task)
         elif new_state == pyatv.const.PowerState.Off:
-            task = asyncio.to_thread(
-                self.bridge.set_light(
-                    light_id=self.light_id,
-                    parameter='on',
-                    value=False,
-                    transitiontime=app_config.backlight_transition
-                )
-            )
+            task = asyncio.create_task(asyncio.to_thread(
+                self.bridge.set_light,
+                light_id=self.light_id,
+                parameter="on",
+                value=False,
+                transitiontime=app_config.backlight_transition,
+            ))
             self.tasks.append(task)
 
     def connection_lost(self, exception):
@@ -104,24 +102,22 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
                 print(msg)
 
                 if connected:
-                    while not (
-                            self.shutdown_event.is_set() or
-                            self.connection_lost_event.is_set()):
+                    events = (self.shutdown_event, self.connection_lost_event)
+                    while not any(e.is_set() for e in events):
                         if self.tasks:
-
                             done, self.tasks = await asyncio.wait(
-                                self.tasks, timeout=1)
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                print(f"{self.name} connection attempt failed: {e}")
-                await asyncio.sleep(RECONNECT_DELAY_S)
+                                fs=self.tasks,
+                                timeout=1
+                            )
+                            for task in done:
+                                task.result()
+                        else:
+                            await asyncio.sleep(0.1)
             finally:
                 await self.close()
 
             if not self.shutdown_event.is_set():
-                await asyncio.sleep(1)
+                await asyncio.sleep(RECONNECT_DELAY_S)
 
     async def connect(self, loop, storage):
         configs = await pyatv.scan(
