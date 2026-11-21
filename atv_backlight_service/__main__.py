@@ -49,7 +49,7 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
         self.atv = None
         self.shutdown_event = shutdown_event
         self.connection_lost_event = asyncio.Event()
-        self.tasks = set()
+        self.hue_tasks = set()
 
     @property
     def name(self):
@@ -73,7 +73,7 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
                 value=True,
                 transitiontime=app_config.backlight_transition,
             ))
-            self.tasks.add(task)
+            self.hue_tasks.add(task)
         elif new_state == pyatv.const.PowerState.Off:
             task = asyncio.create_task(asyncio.to_thread(
                 self.bridge.set_light,
@@ -82,7 +82,7 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
                 value=False,
                 transitiontime=app_config.backlight_transition,
             ))
-            self.tasks.add(task)
+            self.hue_tasks.add(task)
 
     def connection_lost(self, exception):
         print(f"{self.name} lost connection:", str(exception))
@@ -104,17 +104,21 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
                 if connected:
                     events = (self.shutdown_event, self.connection_lost_event)
                     while not any(e.is_set() for e in events):
-                        if self.tasks:
-                            done, self.tasks = await asyncio.wait(
-                                fs=self.tasks,
+                        if self.hue_tasks:
+                            done, self.hue_tasks = await asyncio.wait(
+                                fs=self.hue_tasks,
                                 timeout=1
                             )
-                            for task in done:
-                                task.result()
+                            for hue_task in done:
+                                try:
+                                    hue_task.result()
+                                except Exception as e:
+                                    print(f"Failed to set light: {e}")
                         else:
                             await asyncio.sleep(0.1)
             except asyncio.CancelledError:
-                pass
+                self.shutdown_event.set()
+                raise
             finally:
                 await self.close()
 
@@ -142,15 +146,24 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
         self.atv.listener = self  # Connection callbacks
         self.atv.power.listener = self  # Power state callbacks
 
+        # Set initial state on service startup
+        self.powerstate_update(
+            old_state=pyatv.const.PowerState.Unknown,
+            new_state=self.atv.power.power_state
+        )
+
         return True, f"{self.name} connected"
 
     async def close(self):
         if self.atv:
-            remaining_tasks = self.atv.close()
+            remaining_tasks = self.hue_tasks | self.atv.close()
             try:
                 await asyncio.wait_for(asyncio.gather(*remaining_tasks), 10)
             except asyncio.TimeoutError:
                 print(f"{self.name} timed out waiting for tasks to complete")
+            except Exception as e:
+                print(f"Error in remaining tasks: {e}")
+        self.atv = None
 
 
 async def _read_input(loop: asyncio.AbstractEventLoop, prompt: str):
@@ -439,10 +452,9 @@ async def run_service(loop):
                 task.cancel()
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        for task, result in zip(tasks, results):
+        for result in results:
             if isinstance(result, Exception):
-                if not isinstance(result, asyncio.CancelledError):
-                    raise result
+                raise result
 
     print("Service stopped")
 
@@ -521,5 +533,7 @@ def test():
 
 
 if __name__ == '__main__':
-    # test()
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
