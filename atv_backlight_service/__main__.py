@@ -98,24 +98,29 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
 
             try:
                 print(f"{self.name} connecting")
-                connected, msg = await self.connect(loop, storage)
-                print(msg)
+                try:
+                    await self.connect(loop, storage)
+                except ConnectionError as e:
+                    print(e)
+                    await asyncio.sleep(RECONNECT_DELAY_S)
+                    continue
+                else:
+                    print(f"{self.name} connected")
 
-                if connected:
-                    events = (self.shutdown_event, self.connection_lost_event)
-                    while not any(e.is_set() for e in events):
-                        if self.hue_tasks:
-                            done, self.hue_tasks = await asyncio.wait(
-                                fs=self.hue_tasks,
-                                timeout=1
-                            )
-                            for hue_task in done:
-                                try:
-                                    hue_task.result()
-                                except Exception as e:
-                                    print(f"Failed to set light: {e}")
-                        else:
-                            await asyncio.sleep(0.1)
+                events = (self.shutdown_event, self.connection_lost_event)
+                while not any(e.is_set() for e in events):
+                    if self.hue_tasks:
+                        done, self.hue_tasks = await asyncio.wait(
+                            fs=self.hue_tasks,
+                            timeout=1
+                        )
+                        for hue_task in done:
+                            try:
+                                hue_task.result()
+                            except Exception as e:
+                                print(f"Failed to set light: {e}")
+                    else:
+                        await asyncio.sleep(0.1)
             except asyncio.CancelledError:
                 self.shutdown_event.set()
                 raise
@@ -126,22 +131,26 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
                 await asyncio.sleep(RECONNECT_DELAY_S)
 
     async def connect(self, loop, storage):
-        configs = await pyatv.scan(
-            loop=loop,
-            identifier=self.identifier,
-            storage=storage
-        )
+        try:
+            configs = await pyatv.scan(
+                loop=loop,
+                identifier=self.identifier,
+                storage=storage
+            )
+        except Exception as e:
+            raise ConnectionError("Scan failed") from e
+
         if len(configs) == 1:
             conf = configs[0]
         elif len(configs) > 1:
             raise RuntimeError(f"{len(configs)} ATVs with id={self.identifier}")
         else:
-            return False, f"{self.name} not reachable"
+            raise ConnectionError(f"{self.name} not reachable during scan")
 
         try:
             self.atv = await pyatv.connect(conf, loop)
         except Exception as e:
-            return False, f"{self.name} connection failed: {e}"
+            raise ConnectionError("Connection failed") from e
 
         self.atv.listener = self  # Connection callbacks
         self.atv.power.listener = self  # Power state callbacks
@@ -151,8 +160,6 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
             old_state=pyatv.const.PowerState.Unknown,
             new_state=self.atv.power.power_state
         )
-
-        return True, f"{self.name} connected"
 
     async def close(self):
         if self.atv:
