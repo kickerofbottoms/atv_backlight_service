@@ -24,6 +24,7 @@ import logging
 import random
 import socket
 import sys
+import threading
 
 import pyatv
 from pyatv.storage.file_storage import FileStorage
@@ -39,14 +40,19 @@ pyatv_logger.setLevel(logging.WARNING)
 
 app_config = Config.load()
 
+RECONNECT_DELAY_S = 5
+
 
 class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener):
-    def __init__(self, identifier, bridge, shutdown: asyncio.Event):
+    def __init__(self, loop, identifier, bridge, shutdown_event: asyncio.Event):
+        self.loop = loop
         self.identifier = identifier
         self.bridge = bridge
         self.atv = None
-        self.shutdown = shutdown
-        self.connection_lost = asyncio.Event()
+        self.shutdown_event = shutdown_event
+        self.connection_lost_event = asyncio.Event()
+        self.hue_tasks = set()
+        self.hue_lock = threading.Lock()
 
     @property
     def name(self):
@@ -56,6 +62,17 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
     def light_id(self):
         return app_config.atv[self.identifier].light_id
 
+    def set_light(self, parameter, value=None):
+        with self.hue_lock:
+            response = self.bridge.set_light(
+                light_id=self.light_id,
+                parameter=parameter,
+                value=value,
+                transitiontime=app_config.backlight_transition
+            )
+            if 'error' in list(response[-1][0].keys()):
+                print(f"Error setting light, response={response}")
+
     def powerstate_update(
         self,
         old_state: pyatv.const.PowerState,
@@ -63,84 +80,128 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
     ):
         print(f"{self.name} {new_state.name} (light={self.light_id})")
         if new_state == pyatv.const.PowerState.On:
-            self.bridge.set_light(
-                light_id=self.light_id,
-                parameter='on',
-                value=True,
-                transitiontime=app_config.backlight_transition
+            task = self.loop.create_task(
+                asyncio.to_thread(
+                    self.set_light,
+                    parameter="on",
+                    value=True,
+                )
             )
+            self.hue_tasks.add(task)
         elif new_state == pyatv.const.PowerState.Off:
-            self.bridge.set_light(
-                light_id=self.light_id,
-                parameter='on',
-                value=False,
-                transitiontime=app_config.backlight_transition
+            task = self.loop.create_task(
+                asyncio.to_thread(
+                    self.set_light,
+                    parameter="on",
+                    value=False,
+                )
             )
+            self.hue_tasks.add(task)
+        else:
+            print(f"{self.name} ignoring state {new_state}")
 
     def connection_lost(self, exception):
         print(f"{self.name} lost connection:", str(exception))
-        self.connection_lost.set()
+        self.connection_lost_event.set()
 
     def connection_closed(self):
         print(f"{self.name} connection closed")
-        self.connection_lost.set()
+        self.connection_lost_event.set()
 
     async def persist(self, loop, storage):
-        while not self.shutdown.is_set():
-            self.connection_lost.clear()
+        while not self.shutdown_event.is_set():
+            self.connection_lost_event.clear()
 
-            print(f"{self.name} connecting")
-            connected, msg = await self.connect(loop, storage)
-            print(msg)
-
-            if not connected:
-                await asyncio.sleep(1)
-                continue
-
-            while not (self.shutdown.is_set() or self.connection_lost.is_set()):
+            try:
+                print(f"{self.name} connecting")
                 try:
-                    await asyncio.sleep(1)
-                except asyncio.CancelledError:
-                    print("Shutting down")
-                    self.shutdown.set()
+                    await self.connect(loop, storage)
+                except ConnectionError as e:
+                    print(e)
+                    await asyncio.sleep(RECONNECT_DELAY_S)
+                    continue
+                else:
+                    print(f"{self.name} connected")
 
-            if self.connection_lost.is_set():
-                print(f"{self.name} connection lost")
+                events = (self.shutdown_event, self.connection_lost_event)
+                while not any(e.is_set() for e in events):
+                    if self.hue_tasks:
+                        done, self.hue_tasks = await asyncio.wait(
+                            fs=self.hue_tasks,
+                            timeout=1
+                        )
+                        for hue_task in done:
+                            try:
+                                hue_task.result()
+                            except Exception as e:
+                                print(f"Failed to set light: {e}")
+                    else:
+                        await asyncio.sleep(0.1)
+            except asyncio.CancelledError:
+                self.shutdown_event.set()
+                raise
+            finally:
+                await self.close()
 
-            await self.close()
+            if not self.shutdown_event.is_set():
+                await asyncio.sleep(RECONNECT_DELAY_S)
 
     async def connect(self, loop, storage):
-        configs = await pyatv.scan(
-            loop=loop,
-            identifier=self.identifier,
-            storage=storage
-        )
+        try:
+            configs = await pyatv.scan(
+                loop=loop,
+                identifier=self.identifier,
+                storage=storage
+            )
+        except Exception as e:
+            raise ConnectionError("Scan failed") from e
+
         if len(configs) == 1:
             conf = configs[0]
         elif len(configs) > 1:
             raise RuntimeError(f"{len(configs)} ATVs with id={self.identifier}")
         else:
-            return False, f"{self.name} not reachable"
+            raise ConnectionError(f"{self.name} not reachable during scan")
 
         try:
             self.atv = await pyatv.connect(conf, loop)
         except Exception as e:
-            return False, f"{self.name} connection failed: {e}"
+            raise ConnectionError("Connection failed") from e
 
         self.atv.listener = self  # Connection callbacks
         self.atv.power.listener = self  # Power state callbacks
 
-        return True, f"{self.name} connected"
+        # Set initial state on service startup
+        self.powerstate_update(
+            old_state=pyatv.const.PowerState.Unknown,
+            new_state=self.atv.power.power_state
+        )
 
     async def close(self):
         if self.atv:
-            print(f"{self.name} disconnecting")
-            remaining_tasks = self.atv.close()
-            print(f"{self.name} waiting for {len(remaining_tasks)} tasks")
+            atv_tasks = self.atv.close()
             try:
-                await asyncio.wait_for(asyncio.gather(*remaining_tasks), 10)
+                await asyncio.wait_for(asyncio.gather(*atv_tasks), 10)
             except asyncio.TimeoutError:
-                print(f"{self.name} timed out waiting for tasks")
+                print(f"{self.name} timed out waiting for ATV tasks")
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                print(f"Error in ATV close tasks: {e}")
+            self.atv = None
+
+        if self.hue_tasks:
+            hue_tasks, self.hue_tasks = self.hue_tasks, set()
+            for hue_task in hue_tasks:
+                hue_task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.gather(*hue_tasks), 10)
+            except asyncio.TimeoutError:
+                print(f"{self.name} timed out waiting for Hue tasks")
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                print(f"Error in Hue close tasks: {e}")
 
 
 async def _read_input(loop: asyncio.AbstractEventLoop, prompt: str):
@@ -263,7 +324,8 @@ async def atv_status(loop):
     for conf in atvs:
         atv = await pyatv.connect(conf, loop, storage=storage)
         print(f"{conf.name}: {atv.power.power_state}")
-        atv.close()
+        tasks = atv.close()
+        await asyncio.gather(*tasks)
 
 
 async def hue_pair(loop, address):
@@ -380,16 +442,16 @@ async def attach_backlight(loop):
 
 async def run_service(loop):
     print("ATV backlight service started")
-    shutdown = asyncio.Event()
+    shutdown_event = asyncio.Event()
 
     if not app_config.atv:
         print("No ATVs configured")
-        shutdown.set()
+        shutdown_event.set()
         return
 
     if app_config.hue is None:
         print("No Hue bridge configured")
-        shutdown.set()
+        shutdown_event.set()
         return
 
     print("Connecting to Hue bridge")
@@ -407,19 +469,33 @@ async def run_service(loop):
     print(f"Connecting to {len(app_config.atv)} ATV(s)")
     connections = []
     tasks = []
+
     for atv_id, atv_info in app_config.atv.items():
         if atv_info.light_id is None:
             print(f"{atv_info.name} has no attached lights, skipping")
             continue
-        connection = ATVListener(atv_id, bridge, shutdown)
+
+        connection = ATVListener(loop, atv_id, bridge, shutdown_event)
         connections.append(connection)
         task = asyncio.create_task(connection.persist(loop, storage))
         tasks.append(task)
 
     try:
         await asyncio.gather(*tasks)
-    except asyncio.CancelledError:
-        pass
+    finally:
+        shutdown_event.set()
+
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+        for result in await asyncio.gather(*tasks, return_exceptions=True):
+            not_a_cancelled_error = (
+                isinstance(result, BaseException)
+                and not isinstance(result, asyncio.CancelledError)
+            )
+            if not_a_cancelled_error:
+                print(f"Task failed during shutdown: {result.__traceback__}")
 
     print("Service stopped")
 
@@ -498,5 +574,7 @@ def test():
 
 
 if __name__ == '__main__':
-    # test()
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
