@@ -44,7 +44,8 @@ RECONNECT_DELAY_S = 5
 
 
 class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener):
-    def __init__(self, identifier, bridge, shutdown_event: asyncio.Event):
+    def __init__(self, loop, identifier, bridge, shutdown_event: asyncio.Event):
+        self.loop = loop
         self.identifier = identifier
         self.bridge = bridge
         self.atv = None
@@ -79,7 +80,7 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
     ):
         print(f"{self.name} {new_state.name} (light={self.light_id})")
         if new_state == pyatv.const.PowerState.On:
-            task = asyncio.create_task(
+            task = self.loop.create_task(
                 asyncio.to_thread(
                     self.set_light,
                     parameter="on",
@@ -88,7 +89,7 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
             )
             self.hue_tasks.add(task)
         elif new_state == pyatv.const.PowerState.Off:
-            task = asyncio.create_task(
+            task = self.loop.create_task(
                 asyncio.to_thread(
                     self.set_light,
                     parameter="on",
@@ -468,11 +469,13 @@ async def run_service(loop):
     print(f"Connecting to {len(app_config.atv)} ATV(s)")
     connections = []
     tasks = []
+
     for atv_id, atv_info in app_config.atv.items():
         if atv_info.light_id is None:
             print(f"{atv_info.name} has no attached lights, skipping")
             continue
-        connection = ATVListener(atv_id, bridge, shutdown_event)
+
+        connection = ATVListener(loop, atv_id, bridge, shutdown_event)
         connections.append(connection)
         task = asyncio.create_task(connection.persist(loop, storage))
         tasks.append(task)
@@ -486,10 +489,13 @@ async def run_service(loop):
             if not task.done():
                 task.cancel()
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for result in results:
-            if isinstance(result, Exception):
-                raise result
+        for result in await asyncio.gather(*tasks, return_exceptions=True):
+            not_a_cancelled_error = (
+                isinstance(result, BaseException)
+                and not isinstance(result, asyncio.CancelledError)
+            )
+            if not_a_cancelled_error:
+                print(f"Task failed during shutdown: {result.__traceback__}")
 
     print("Service stopped")
 
