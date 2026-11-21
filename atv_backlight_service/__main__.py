@@ -63,12 +63,14 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
 
     def set_light(self, parameter, value=None):
         with self.hue_lock:
-            self.bridge.set_light(
+            response = self.bridge.set_light(
                 light_id=self.light_id,
                 parameter=parameter,
                 value=value,
                 transitiontime=app_config.backlight_transition
             )
+            if 'error' in list(response[-1][0].keys()):
+                print(f"Error setting light, response={response}")
 
     def powerstate_update(
         self,
@@ -94,6 +96,8 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
                 )
             )
             self.hue_tasks.add(task)
+        else:
+            print(f"{self.name} ignoring state {new_state}")
 
     def connection_lost(self, exception):
         print(f"{self.name} lost connection:", str(exception))
@@ -174,16 +178,29 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
 
     async def close(self):
         if self.atv:
-            remaining_tasks = self.hue_tasks | self.atv.close()
+            atv_tasks = self.atv.close()
             try:
-                await asyncio.wait_for(asyncio.gather(*remaining_tasks), 10)
+                await asyncio.wait_for(asyncio.gather(*atv_tasks), 10)
             except asyncio.TimeoutError:
-                print(f"{self.name} timed out waiting for tasks to complete")
+                print(f"{self.name} timed out waiting for ATV tasks")
             except asyncio.CancelledError:
                 pass
             except Exception as e:
-                print(f"Error in remaining tasks: {e}")
-        self.atv = None
+                print(f"Error in ATV close tasks: {e}")
+            self.atv = None
+
+        if self.hue_tasks:
+            hue_tasks, self.hue_tasks = self.hue_tasks, set()
+            for hue_task in hue_tasks:
+                hue_task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.gather(*hue_tasks), 10)
+            except asyncio.TimeoutError:
+                print(f"{self.name} timed out waiting for Hue tasks")
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                print(f"Error in Hue close tasks: {e}")
 
 
 async def _read_input(loop: asyncio.AbstractEventLoop, prompt: str):
