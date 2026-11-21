@@ -113,6 +113,8 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
                                 task.result()
                         else:
                             await asyncio.sleep(0.1)
+            except asyncio.CancelledError:
+                pass
             finally:
                 await self.close()
 
@@ -144,13 +146,11 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
 
     async def close(self):
         if self.atv:
-            print(f"{self.name} disconnecting")
             remaining_tasks = self.atv.close()
-            print(f"{self.name} waiting for {len(remaining_tasks)} tasks")
             try:
                 await asyncio.wait_for(asyncio.gather(*remaining_tasks), 10)
             except asyncio.TimeoutError:
-                print(f"{self.name} timed out waiting for tasks")
+                print(f"{self.name} timed out waiting for tasks to complete")
 
 
 async def _read_input(loop: asyncio.AbstractEventLoop, prompt: str):
@@ -430,13 +430,7 @@ async def run_service(loop):
     try:
         await asyncio.gather(*tasks)
     except asyncio.CancelledError:
-        print("Service cancellation requested")
         shutdown_event.set()
-        raise
-    except Exception:
-        print("A listener failed; stopping service")
-        shutdown_event.set()
-        raise
     finally:
         shutdown_event.set()
 
@@ -446,10 +440,9 @@ async def run_service(loop):
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for task, result in zip(tasks, results):
-            if isinstance(result, Exception) and not isinstance(
-                result, asyncio.CancelledError
-            ):
-                print(f"Listener task failed: {result}")
+            if isinstance(result, Exception):
+                if not isinstance(result, asyncio.CancelledError):
+                    raise result
 
     print("Service stopped")
 
