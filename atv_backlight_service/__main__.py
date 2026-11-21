@@ -24,6 +24,7 @@ import logging
 import random
 import socket
 import sys
+import threading
 
 import pyatv
 from pyatv.storage.file_storage import FileStorage
@@ -50,6 +51,7 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
         self.shutdown_event = shutdown_event
         self.connection_lost_event = asyncio.Event()
         self.hue_tasks = set()
+        self.hue_lock = threading.Lock()
 
     @property
     def name(self):
@@ -59,6 +61,15 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
     def light_id(self):
         return app_config.atv[self.identifier].light_id
 
+    def set_light(self, parameter, value=None):
+        with self.hue_lock:
+            self.bridge.set_light(
+                light_id=self.light_id,
+                parameter=parameter,
+                value=value,
+                transitiontime=app_config.backlight_transition
+            )
+
     def powerstate_update(
         self,
         old_state: pyatv.const.PowerState,
@@ -66,22 +77,22 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
     ):
         print(f"{self.name} {new_state.name} (light={self.light_id})")
         if new_state == pyatv.const.PowerState.On:
-            task = asyncio.create_task(asyncio.to_thread(
-                self.bridge.set_light,
-                light_id=self.light_id,
-                parameter="on",
-                value=True,
-                transitiontime=app_config.backlight_transition,
-            ))
+            task = asyncio.create_task(
+                asyncio.to_thread(
+                    self.set_light,
+                    parameter="on",
+                    value=True,
+                )
+            )
             self.hue_tasks.add(task)
         elif new_state == pyatv.const.PowerState.Off:
-            task = asyncio.create_task(asyncio.to_thread(
-                self.bridge.set_light,
-                light_id=self.light_id,
-                parameter="on",
-                value=False,
-                transitiontime=app_config.backlight_transition,
-            ))
+            task = asyncio.create_task(
+                asyncio.to_thread(
+                    self.set_light,
+                    parameter="on",
+                    value=False,
+                )
+            )
             self.hue_tasks.add(task)
 
     def connection_lost(self, exception):
@@ -168,6 +179,8 @@ class ATVListener(pyatv.interface.PowerListener, pyatv.interface.DeviceListener)
                 await asyncio.wait_for(asyncio.gather(*remaining_tasks), 10)
             except asyncio.TimeoutError:
                 print(f"{self.name} timed out waiting for tasks to complete")
+            except asyncio.CancelledError:
+                pass
             except Exception as e:
                 print(f"Error in remaining tasks: {e}")
         self.atv = None
@@ -449,8 +462,6 @@ async def run_service(loop):
 
     try:
         await asyncio.gather(*tasks)
-    except asyncio.CancelledError:
-        shutdown_event.set()
     finally:
         shutdown_event.set()
 
